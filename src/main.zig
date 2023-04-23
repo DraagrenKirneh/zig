@@ -298,6 +298,8 @@ pub fn mainArgs(gpa: Allocator, arena: Allocator, args: []const []const u8) !voi
         return cmdBuild(gpa, arena, cmd_args);
     } else if (mem.eql(u8, cmd, "fmt")) {
         return cmdFmt(gpa, arena, cmd_args);
+    } else if (mem.eql(u8, cmd, "pkg")) {
+        return cmdPkg(gpa, arena, cmd_args);
     } else if (mem.eql(u8, cmd, "objcopy")) {
         return @import("objcopy.zig").cmdObjCopy(gpa, arena, cmd_args);
     } else if (mem.eql(u8, cmd, "libc")) {
@@ -4138,6 +4140,149 @@ pub fn cmdInit(
         .Exe => std.log.info("Next, try `zig build --help` or `zig build run`", .{}),
         .Obj => unreachable,
     }
+}
+
+pub const usage_pkg =
+    \\Usage: zig pkg [command] [options]
+    \\
+    \\  Runs a package command
+    \\
+    \\Commands:
+    \\  fetch                Calculates the package hash of the current directory.          
+    \\
+    \\Options: 
+    \\  -h --help           Print this help and exit.
+    \\
+;
+
+pub fn cmdPkg(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
+    if (args.len == 0) fatal("Expected at least one argument.\n", .{});
+
+    for (args) |arg| {
+        if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
+            const stdout = io.getStdOut().writer();
+            try stdout.writeAll(usage_pkg);
+            return cleanExit();
+        }
+    }
+
+    const command_arg = args[0];
+    if (!mem.eql(u8, command_arg, "fetch")) fatal("Invalid command: {s}\n", .{command_arg});
+
+    return cmdPkgFetch(gpa, arena);
+}
+
+pub fn cmdPkgFetch(gpa: Allocator, arena: Allocator) !void {
+    var color: Color = .auto;
+
+    var cleanup_build_runner_dir: ?fs.Dir = null;
+    defer if (cleanup_build_runner_dir) |*dir| dir.close();
+    const cwd_path = try process.getCwdAlloc(arena);
+
+    var build_file: ?[]const u8 = null;
+    var cleanup_build_dir: ?fs.Dir = null;
+    defer if (cleanup_build_dir) |*dir| dir.close();
+    const build_zig_basename = if (build_file) |bf| fs.path.basename(bf) else "build.zig";
+    const build_directory: Compilation.Directory = blk: {
+        if (build_file) |bf| {
+            if (fs.path.dirname(bf)) |dirname| {
+                const dir = fs.cwd().openDir(dirname, .{}) catch |err| {
+                    fatal("unable to open directory to build file from argument 'build-file', '{s}': {s}", .{ dirname, @errorName(err) });
+                };
+                cleanup_build_dir = dir;
+                break :blk .{ .path = dirname, .handle = dir };
+            }
+            break :blk .{ .path = null, .handle = fs.cwd() };
+        }
+        // Search up parent directories until we find build.zig.
+        var dirname: []const u8 = cwd_path;
+        while (true) {
+            const joined_path = try fs.path.join(arena, &[_][]const u8{ dirname, build_zig_basename });
+            if (fs.cwd().access(joined_path, .{})) |_| {
+                const dir = fs.cwd().openDir(dirname, .{}) catch |err| {
+                    fatal("unable to open directory while searching for build.zig file, '{s}': {s}", .{ dirname, @errorName(err) });
+                };
+                if (!mem.eql(u8, dirname, cwd_path)) {
+                    cleanup_build_dir = dir;
+                }
+                break :blk .{ .path = dirname, .handle = dir };
+            } else |err| switch (err) {
+                error.FileNotFound => {
+                    dirname = fs.path.dirname(dirname) orelse {
+                        std.log.info("{s}", .{
+                            \\Initialize a 'build.zig' template file with `zig init-lib` or `zig init-exe`,
+                            \\or see `zig --help` for more options.
+                        });
+                        fatal("No 'build.zig' file found, in the current directory or any parent directories.", .{});
+                    };
+                    continue;
+                },
+                else => |e| return e,
+            }
+        }
+    };
+
+    var override_global_cache_dir: ?[]const u8 = try optionalStringEnvVar(arena, "ZIG_GLOBAL_CACHE_DIR");
+    var global_cache_directory: Compilation.Directory = l: {
+        const p = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(arena);
+        break :l .{
+            .handle = try fs.cwd().makeOpenPath(p, .{}),
+            .path = p,
+        };
+    };
+    defer global_cache_directory.handle.close();
+
+    var override_local_cache_dir: ?[]const u8 = try optionalStringEnvVar(arena, "ZIG_LOCAL_CACHE_DIR");
+    var local_cache_directory: Compilation.Directory = l: {
+        if (override_local_cache_dir) |local_cache_dir_path| {
+            break :l .{
+                .handle = try fs.cwd().makeOpenPath(local_cache_dir_path, .{}),
+                .path = local_cache_dir_path,
+            };
+        }
+        const cache_dir_path = try build_directory.join(arena, &[_][]const u8{"zig-cache"});
+        break :l .{
+            .handle = try build_directory.handle.makeOpenPath("zig-cache", .{}),
+            .path = cache_dir_path,
+        };
+    };
+    defer local_cache_directory.handle.close();
+
+    // Here we borrow main package's table and will replace it with a fresh
+    // one after this process completes.
+
+    var wip_errors: std.zig.ErrorBundle.Wip = undefined;
+    try wip_errors.init(gpa);
+    defer wip_errors.deinit();
+
+    var all_modules: Package.AllModules = .{};
+    defer all_modules.deinit(gpa);
+
+    var thread_pool: ThreadPool = undefined;
+    try thread_pool.init(.{ .allocator = gpa });
+    defer thread_pool.deinit();
+
+    var http_client: std.http.Client = .{ .allocator = gpa };
+    defer http_client.deinit();
+
+    const fetch_result = Package.fetchDependencies(
+        arena,
+        &thread_pool,
+        &http_client,
+        build_directory,
+        global_cache_directory,
+        local_cache_directory,
+        "",
+        &wip_errors,
+    );
+
+    if (wip_errors.root_list.items.len > 0) {
+        var errors = try wip_errors.toOwnedBundle("");
+        defer errors.deinit(gpa);
+        errors.renderToStdErr(renderOptions(color));
+        process.exit(1);
+    }
+    try fetch_result;
 }
 
 pub const usage_build =

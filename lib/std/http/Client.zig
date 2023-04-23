@@ -521,7 +521,6 @@ pub const Request = struct {
         req.client.connection_pool.release(req.client, req.connection);
 
         req.arena.deinit();
-        req.* = undefined;
     }
 
     pub const StartError = BufferedConnection.WriteError || error{ InvalidContentLength, UnsupportedTransferEncoding };
@@ -636,8 +635,12 @@ pub const Request = struct {
     /// redirects.
     pub fn do(req: *Request) DoError!void {
         while (true) { // handle redirects
+            try req.start();
             while (true) { // read headers
-                try req.connection.data.buffered.fill();
+                req.connection.data.buffered.fill() catch |e| {
+                    std.debug.print("\nError read headers\n", .{});
+                    return e;
+                };
 
                 const nchecked = try req.response.parser.checkCompleteHead(req.client.allocator, req.connection.data.buffered.peek());
                 req.connection.data.buffered.clear(@intCast(u16, nchecked));
@@ -645,7 +648,6 @@ pub const Request = struct {
                 if (req.response.parser.state.isContent()) break;
             }
 
-            req.response.headers = http.Headers{ .allocator = req.client.allocator, .owned = false };
             try req.response.parse(req.response.parser.header_bytes.items);
 
             if (req.response.status == .switching_protocols) {
@@ -697,14 +699,14 @@ pub const Request = struct {
                     return error.HttpRedirectMissingLocation;
                 const new_url = Uri.parse(location) catch try Uri.parseWithoutScheme(location);
 
-                var new_arena = std.heap.ArenaAllocator.init(req.client.allocator);
-                const resolved_url = try req.uri.resolve(new_url, false, new_arena.allocator());
-                errdefer new_arena.deinit();
+                // var new_arena = std.heap.ArenaAllocator.init(req.client.allocator);
+                const resolved_url = try req.uri.resolve(new_url, false, req.arena.allocator());
+                //errdefer new_arena.deinit();
 
-                req.arena.deinit();
-                req.arena = new_arena;
+                // req.arena.deinit();
+                //req.arena = new_arena;
 
-                const new_req = try req.client.request(req.method, resolved_url, req.headers, .{
+                req.* = try req.client.initRequest(req.method, resolved_url, req.headers, .{
                     .version = req.version,
                     .max_redirects = req.redirects_left - 1,
                     .header_strategy = if (req.response.parser.header_bytes_owned) .{
@@ -713,8 +715,22 @@ pub const Request = struct {
                         .static = req.response.parser.header_bytes.items.ptr[0..req.response.parser.max_header_bytes],
                     },
                 });
-                req.deinit();
-                req.* = new_req;
+                // _ = new_req;
+                // req.uri = resolved_url;
+                // req.redirects_left = req.redirects_left - 1;
+                // req.response = .{
+                //     .status = undefined,
+                //     .reason = undefined,
+                //     .version = undefined,
+                //     .headers = http.Headers{ .allocator = req.client.allocator, .owned = false },
+                //     .parser = switch (Options.HeaderStrategy{ .dynamic = 16 * 1024 }) {
+                //         .dynamic => |max| proto.HeadersParser.initDynamic(max),
+                //         .static => |buf| proto.HeadersParser.initStatic(buf),
+                //     },
+                // };
+
+                //req.deinit();
+                //new_req.client.allocator.destroy(req);
             } else {
                 req.response.skip = false;
                 if (!req.response.parser.done) {
@@ -758,14 +774,18 @@ pub const Request = struct {
             const has_trail = !req.response.parser.state.isContent();
 
             while (!req.response.parser.state.isContent()) { // read trailing headers
-                try req.connection.data.buffered.fill();
+                req.connection.data.buffered.fill() catch |e| {
+                    std.debug.print("\nError read trailing headers\n", .{});
+                    return e;
+                };
 
                 const nchecked = try req.response.parser.checkCompleteHead(req.client.allocator, req.connection.data.buffered.peek());
                 req.connection.data.buffered.clear(@intCast(u16, nchecked));
             }
 
             if (has_trail) {
-                req.response.headers = http.Headers{ .allocator = req.client.allocator, .owned = false };
+                std.debug.print("\n\n --- trail\n\n", .{});
+                //req.response.headers = http.Headers{ .allocator = req.client.allocator, .owned = false };
 
                 // The response headers before the trailers are already guaranteed to be valid, so they will always be parsed again and cannot return an error.
                 // This will *only* fail for a malformed trailer.
@@ -982,9 +1002,7 @@ pub const protocol_map = std.ComptimeStringMap(Connection.Protocol, .{
     .{ "wss", .tls },
 });
 
-/// Form and send a http request to a server.
-/// This function is threadsafe.
-pub fn request(client: *Client, method: http.Method, uri: Uri, headers: http.Headers, options: Options) RequestError!Request {
+pub fn initRequest(client: *Client, method: http.Method, uri: Uri, headers: http.Headers, options: Options) RequestError!Request {
     const protocol = protocol_map.get(uri.scheme) orelse return error.UnsupportedUrlScheme;
 
     const port: u16 = uri.port orelse switch (protocol) {
@@ -1019,7 +1037,7 @@ pub fn request(client: *Client, method: http.Method, uri: Uri, headers: http.Hea
             .status = undefined,
             .reason = undefined,
             .version = undefined,
-            .headers = undefined,
+            .headers = http.Headers{ .allocator = client.allocator, .owned = false },
             .parser = switch (options.header_strategy) {
                 .dynamic => |max| proto.HeadersParser.initDynamic(max),
                 .static => |buf| proto.HeadersParser.initStatic(buf),
@@ -1027,10 +1045,21 @@ pub fn request(client: *Client, method: http.Method, uri: Uri, headers: http.Hea
         },
         .arena = undefined,
     };
-    errdefer req.deinit();
+    errdefer {
+        req.deinit();
+    }
 
     req.arena = std.heap.ArenaAllocator.init(client.allocator);
 
+    return req;
+}
+
+/// Form and send a http request to a server.
+/// This function is not threadsafe.
+pub fn request(client: *Client, method: http.Method, uri: Uri, headers: http.Headers, options: Options) RequestError!*Request {
+    var req = try client.allocator.create(Request);
+    errdefer client.allocator.destroy(req);
+    req.* = try initRequest(client, method, uri, headers, options);
     return req;
 }
 
