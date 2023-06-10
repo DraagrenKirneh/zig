@@ -3436,6 +3436,18 @@ pub const sockaddr = extern struct {
             std.debug.assert(@sizeOf(vm) == @sizeOf(sockaddr));
         }
     };
+
+    /// Address structure for bluetooth socket adapter
+    pub const rc = extern struct {
+        family: sa_family_t = AF.BLUETOOTH,
+        bdaddr: [6]u8,
+        channel: u8,
+
+        // zero: [7]u8 = [_]u8{0} ** 7,
+        // comptime {
+        //     std.debug.assert(@sizeOf(vm) == @sizeOf(sockaddr));
+        // }
+    };
 };
 
 pub const mmsghdr = extern struct {
@@ -4288,6 +4300,10 @@ pub const IPPROTO = struct {
     pub const MPLS = 137;
     pub const RAW = 255;
     pub const MAX = 256;
+};
+
+pub const BTHPROTO = struct {
+    pub const RFCOMM = 3;
 };
 
 pub const RR = struct {

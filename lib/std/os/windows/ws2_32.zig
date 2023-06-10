@@ -508,6 +508,7 @@ pub const AF = struct {
     pub const TCNPROCESS = 29;
     pub const TCNMESSAGE = 30;
     pub const ICLFXBM = 31;
+    pub const BLUETOOTH = 32;
     pub const LINK = 33;
     pub const HYPERV = 34;
 };
@@ -890,6 +891,10 @@ pub const IPPROTO = struct {
     pub const MAX = 256;
 };
 
+pub const BTHPROTO = struct {
+    pub const RFCOMM = 3;
+};
+
 pub const IP_DEFAULT_MULTICAST_TTL = 1;
 pub const IP_DEFAULT_MULTICAST_LOOP = 1;
 pub const IP_MAX_MEMBERSHIPS = 20;
@@ -1138,6 +1143,17 @@ pub const sockaddr = extern struct {
     pub const un = extern struct {
         family: ADDRESS_FAMILY = AF.UNIX,
         path: [108]u8,
+    };
+
+    /// Address structure for bluetooth socket adapter
+    pub const rc = extern struct {
+        family: ADDRESS_FAMILY = AF.BLUETOOTH,
+        address: BTH_ADDR = 0,
+        serviceClassId: GUID = RFCOMM_PROTOCOL_UUID,
+        port: windows.ULONG = 0,
+
+        const BTH_ADDR = windows.ULONGLONG;
+        pub const RFCOMM_PROTOCOL_UUID: GUID = GUID.parse("{00000003-0000-1000-8000-00805f9b34fb}");
     };
 };
 
